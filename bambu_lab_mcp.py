@@ -11,8 +11,11 @@ Required environment variables:
 
 import asyncio
 import json
+import logging
 import os
 import ssl
+import threading
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime
 from enum import Enum
@@ -27,6 +30,14 @@ CHARACTER_LIMIT = 25000
 MQTT_PORT = 8883
 MQTT_USERNAME = "bblp"
 MQTT_QOS = 0
+
+# Reconnection configuration
+RECONNECT_MAX_RETRIES = int(os.getenv("BAMBU_RECONNECT_MAX_RETRIES", "10"))
+RECONNECT_BACKOFF_FACTOR = float(os.getenv("BAMBU_RECONNECT_BACKOFF_FACTOR", "1.5"))
+RECONNECT_BASE_DELAY = float(os.getenv("BAMBU_RECONNECT_BASE_DELAY", "1.0"))
+RECONNECT_MAX_DELAY = float(os.getenv("BAMBU_RECONNECT_MAX_DELAY", "60.0"))
+
+logger = logging.getLogger("bambu_mcp")
 
 # State management for printer status
 printer_state: Dict[str, Any] = {}
@@ -45,6 +56,32 @@ class PrintCommand(str, Enum):
     PAUSE = "pause"
     RESUME = "resume"
     STOP = "stop"
+
+
+class ConnectionState(str, Enum):
+    """MQTT connection state."""
+    CONNECTED = "connected"
+    DISCONNECTED = "disconnected"
+    RECONNECTING = "reconnecting"
+
+
+# Connection state tracking
+_connection_state = ConnectionState.DISCONNECTED
+_reconnect_attempt = 0
+_last_disconnect_time: Optional[float] = None
+_reconnect_lock = threading.Lock()
+
+
+def get_connection_state() -> ConnectionState:
+    """Get the current MQTT connection state."""
+    return _connection_state
+
+
+def _set_connection_state(state: ConnectionState) -> None:
+    """Set the current MQTT connection state."""
+    global _connection_state
+    _connection_state = state
+    logger.info(f"Connection state changed to: {state.value}")
 
 
 # === MQTT Connection Management ===
@@ -91,20 +128,114 @@ def setup_mqtt_client() -> mqtt.Client:
 
 def on_connect(client: mqtt.Client, userdata: Any, flags: Dict, rc: int) -> None:
     """Callback for when client connects to MQTT broker."""
+    global _reconnect_attempt
     if rc == 0:
         serial_number = os.getenv("BAMBU_SERIAL_NUMBER")
         # Subscribe to printer status reports
         client.subscribe(f"device/{serial_number}/report", qos=MQTT_QOS)
         connection_ready.set()
-        print(f"Connected to Bambu Lab printer {serial_number}")
+        _reconnect_attempt = 0
+        _set_connection_state(ConnectionState.CONNECTED)
+        logger.info(f"Connected to Bambu Lab printer {serial_number}")
     else:
-        print(f"Failed to connect to printer, return code: {rc}")
+        _set_connection_state(ConnectionState.DISCONNECTED)
+        logger.warning(f"Failed to connect to printer, return code: {rc}")
 
 
 def on_disconnect(client: mqtt.Client, userdata: Any, rc: int) -> None:
-    """Callback for when client disconnects from MQTT broker."""
+    """Callback for when client disconnects from MQTT broker.
+
+    If the disconnect was unexpected (rc != 0), starts auto-reconnection
+    with exponential backoff in a background thread.
+    """
+    global _reconnect_attempt, _last_disconnect_time
     connection_ready.clear()
-    print(f"Disconnected from printer, return code: {rc}")
+    _last_disconnect_time = time.time()
+    logger.warning(f"Disconnected from printer, return code: {rc}")
+
+    if rc != 0:
+        # Unexpected disconnect — attempt auto-reconnect
+        _set_connection_state(ConnectionState.RECONNECTING)
+        thread = threading.Thread(
+            target=_reconnect_loop, args=(client,), daemon=True
+        )
+        thread.start()
+    else:
+        # Clean disconnect (user-initiated)
+        _set_connection_state(ConnectionState.DISCONNECTED)
+
+
+def _reconnect_loop(client: mqtt.Client) -> None:
+    """Background reconnection loop with exponential backoff.
+
+    Runs in a daemon thread. Tries up to RECONNECT_MAX_RETRIES times,
+    with delays growing exponentially (capped at RECONNECT_MAX_DELAY).
+    """
+    global _reconnect_attempt
+
+    with _reconnect_lock:
+        while _reconnect_attempt < RECONNECT_MAX_RETRIES:
+            _reconnect_attempt += 1
+            delay = min(
+                RECONNECT_BASE_DELAY * (RECONNECT_BACKOFF_FACTOR ** (_reconnect_attempt - 1)),
+                RECONNECT_MAX_DELAY,
+            )
+            logger.info(
+                f"Reconnection attempt {_reconnect_attempt}/{RECONNECT_MAX_RETRIES} "
+                f"in {delay:.1f}s"
+            )
+            time.sleep(delay)
+
+            # If we reconnected while sleeping (e.g. paho's own retry), stop
+            if _connection_state == ConnectionState.CONNECTED:
+                return
+
+            try:
+                client.reconnect()
+                # on_connect callback will set state to CONNECTED if successful
+                # Wait briefly for the callback to fire
+                time.sleep(2.0)
+                if _connection_state == ConnectionState.CONNECTED:
+                    logger.info("Reconnection successful")
+                    return
+            except Exception as e:
+                logger.warning(f"Reconnection attempt {_reconnect_attempt} failed: {e}")
+
+        # Exhausted all retries
+        _set_connection_state(ConnectionState.DISCONNECTED)
+        logger.error(
+            f"Failed to reconnect after {RECONNECT_MAX_RETRIES} attempts. "
+            "Printer may be unreachable."
+        )
+
+
+def reconnect() -> None:
+    """Manually trigger MQTT client reconnection.
+
+    Tears down the existing client and creates a fresh one.
+    Use this when automatic reconnection has failed and you want to retry.
+    """
+    global mqtt_client, _reconnect_attempt
+    _reconnect_attempt = 0
+
+    if mqtt_client is not None:
+        try:
+            mqtt_client.loop_stop()
+            mqtt_client.disconnect()
+        except Exception:
+            pass
+        mqtt_client = None
+
+    _set_connection_state(ConnectionState.RECONNECTING)
+    connection_ready.clear()
+
+    try:
+        mqtt_client = setup_mqtt_client()
+        logger.info("Manual reconnection initiated with fresh client")
+    except Exception as e:
+        _set_connection_state(ConnectionState.DISCONNECTED)
+        logger.error(f"Manual reconnection failed: {e}")
+        raise
 
 
 def on_message(client: mqtt.Client, userdata: Any, msg: mqtt.MQTTMessage) -> None:
@@ -119,8 +250,41 @@ def on_message(client: mqtt.Client, userdata: Any, msg: mqtt.MQTTMessage) -> Non
 
 
 async def ensure_connection() -> None:
-    """Ensure MQTT connection is ready before operations."""
-    await asyncio.wait_for(connection_ready.wait(), timeout=10.0)
+    """Ensure MQTT connection is ready before operations.
+
+    If not connected, waits for up to 10 seconds per attempt, retrying
+    up to 3 times. On persistent failure, attempts a full reconnection
+    before giving up.
+    """
+    max_wait_attempts = 3
+
+    for attempt in range(max_wait_attempts):
+        try:
+            await asyncio.wait_for(connection_ready.wait(), timeout=10.0)
+            return
+        except asyncio.TimeoutError:
+            current_state = get_connection_state()
+            logger.warning(
+                f"Connection wait timed out (attempt {attempt + 1}/{max_wait_attempts}, "
+                f"state: {current_state.value})"
+            )
+
+            if current_state == ConnectionState.RECONNECTING:
+                # Already reconnecting, give it more time
+                continue
+
+            if attempt < max_wait_attempts - 1:
+                # Try a manual reconnect before the next wait
+                try:
+                    reconnect()
+                except Exception as e:
+                    logger.warning(f"Reconnect attempt failed: {e}")
+                await asyncio.sleep(1.0)
+
+    raise asyncio.TimeoutError(
+        "Could not establish MQTT connection after multiple attempts. "
+        f"Connection state: {get_connection_state().value}"
+    )
 
 
 async def request_full_status() -> None:
@@ -504,6 +668,95 @@ async def bambu_set_speed(params: SetSpeedInput) -> str:
         return "Error: Could not connect to printer. Please check that the printer is powered on and connected to the network."
     except Exception as e:
         return f"Error setting print speed: {str(e)}"
+
+
+@mcp.tool(
+    name="bambu_connection_status",
+    annotations={
+        "title": "Get Connection Status",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False
+    }
+)
+async def bambu_connection_status() -> str:
+    """Get the current MQTT connection status.
+
+    Returns the connection state (connected, disconnected, or reconnecting),
+    reconnection attempt count, and time since last disconnect if applicable.
+
+    Returns:
+        str: JSON object with connection details
+
+    Example Usage:
+        - "Is the printer connected?"
+        - "What's the connection status?"
+    """
+    state = get_connection_state()
+    info: Dict[str, Any] = {
+        "state": state.value,
+        "reconnect_attempt": _reconnect_attempt,
+        "max_retries": RECONNECT_MAX_RETRIES,
+    }
+
+    if _last_disconnect_time is not None:
+        elapsed = time.time() - _last_disconnect_time
+        info["seconds_since_last_disconnect"] = round(elapsed, 1)
+
+    if state == ConnectionState.CONNECTED:
+        info["message"] = "MQTT client is connected to the printer."
+    elif state == ConnectionState.RECONNECTING:
+        info["message"] = (
+            f"Attempting to reconnect (attempt {_reconnect_attempt}/{RECONNECT_MAX_RETRIES})."
+        )
+    else:
+        info["message"] = "MQTT client is disconnected from the printer."
+
+    return json.dumps(info, indent=2)
+
+
+@mcp.tool(
+    name="bambu_reconnect",
+    annotations={
+        "title": "Reconnect to Printer",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True
+    }
+)
+async def bambu_reconnect() -> str:
+    """Manually trigger reconnection to the printer.
+
+    Tears down the existing MQTT connection and creates a fresh one.
+    Use this when the printer shows as disconnected and auto-reconnect has failed.
+
+    Returns:
+        str: Result of the reconnection attempt
+
+    Example Usage:
+        - "Reconnect to my printer"
+        - "The printer connection dropped, reconnect"
+    """
+    try:
+        reconnect()
+        await asyncio.wait_for(connection_ready.wait(), timeout=15.0)
+        return json.dumps({
+            "state": get_connection_state().value,
+            "message": "Successfully reconnected to the printer."
+        }, indent=2)
+    except asyncio.TimeoutError:
+        return json.dumps({
+            "state": get_connection_state().value,
+            "message": "Reconnection initiated but connection not yet established. "
+                       "The client will continue attempting in the background."
+        }, indent=2)
+    except Exception as e:
+        return json.dumps({
+            "state": get_connection_state().value,
+            "message": f"Reconnection failed: {str(e)}"
+        }, indent=2)
 
 
 # === Main Entry Point ===
